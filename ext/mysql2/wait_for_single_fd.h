@@ -15,21 +15,27 @@
 static int my_wait_for_single_fd(int fd, int events, struct timeval *tvp)
 {
   fd_set fdset;
-  fd_set *rfds = NULL;
-  fd_set *wfds = NULL;
-  fd_set *efds = NULL;
+  fd_set *rfds;
+  fd_set *wfds;
+  fd_set *efds;
+  int retval;
 
-  FD_ZERO(&fdset);
-  FD_SET(fd, &fdset);
+  for (;;) {
+    FD_ZERO(&fdset);
+    FD_SET(fd, &fdset);
 
-  if (events & RB_WAITFD_IN)
-    rfds = &fdset;
-  if (events & RB_WAITFD_OUT)
-    wfds = &fdset;
-  if (events & RB_WAITFD_PRI)
-    efds = &fdset;
+    rfds = (events & RB_WAITFD_IN)  ? &fdset : NULL;
+    wfds = (events & RB_WAITFD_OUT) ? &fdset : NULL;
+    efds = (events & RB_WAITFD_PRI) ? &fdset : NULL;
 
-  return rb_thread_select(fd + 1, rfds, wfds, efds, tvp);
+    retval = rb_thread_select(fd + 1, rfds, wfds, efds, tvp);
+    /* work around bug in 1.8.7-p374 scheduler that sometimes returns timeout when it shouldn't */
+    /* https://www.ruby-forum.com/topic/194009 */
+
+    if (retval || tvp)
+      break;
+  }
+  return retval;
 }
 
 #define rb_wait_for_single_fd(fd,events,tvp) \
