@@ -935,7 +935,7 @@ static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
 
   // Backward compat
   args.symbolizeKeys = symbolizeKeys;
-  args.as = AS_HASH;
+  args.as = as;
   args.castBool = castBool;
   args.cacheRows = cacheRows;
   args.cast = cast;
