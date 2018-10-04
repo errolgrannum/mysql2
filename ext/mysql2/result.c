@@ -48,7 +48,7 @@ static VALUE sym_symbolize_keys, sym_as, sym_array, sym_struct, sym_database_tim
 
 /* wrapper for intern.h:rb_struct_define() */
 #define STRUCT_MAX_COLUMNS  100
-static VALUE rb_mysql_struct_define2(const char *name, char **ary, int len);
+static VALUE rb_mysql_struct_define2(const char *name, char **ary, my_ulonglong len);
 
 
 /* Mark any VALUEs that are only referenced in C, so the GC won't get them. */
@@ -477,7 +477,7 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
     }
 
     if (args->as == AS_HASH) {
-      rb_hash_aset(rowval, field, val);
+      rb_hash_aset(rowVal, field, val);
     } else {
       rb_ary_push(rowVal, val);
     }
@@ -488,10 +488,10 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
       char *buf[STRUCT_MAX_COLUMNS];
 
       if (wrapper->numberOfFields > STRUCT_MAX_COLUMNS)
-        rb_raise(cMysql2Error, "Too many struct fields: %d", wrapper->numberOfFields);
+        rb_raise(cMysql2Error, "Too many struct fields: %llu", wrapper->numberOfFields);
 
       for (i = 0; i < wrapper->numberOfFields; i++) {
-        VALUE field = rb_mysql_result_fetch_field(self, i, symbolizeKeys);
+        VALUE field = rb_mysql_result_fetch_field(self, i, args->symbolizeKeys);
         buf[i] = StringValuePtr(field);
       }
 
@@ -721,10 +721,10 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
       char *buf[STRUCT_MAX_COLUMNS];
 
       if (wrapper->numberOfFields > STRUCT_MAX_COLUMNS)
-        rb_raise(cMysql2Error, "Too many struct fields: %d", wrapper->numberOfFields);
+        rb_raise(cMysql2Error, "Too many struct fields: %llu", wrapper->numberOfFields);
 
       for (i = 0; i < wrapper->numberOfFields; i++) {
-        VALUE field = rb_mysql_result_fetch_field(self, i, symbolizeKeys);
+        VALUE field = rb_mysql_result_fetch_field(self, i, args->symbolizeKeys);
         buf[i] = StringValuePtr(field);
       }
 
@@ -1078,7 +1078,7 @@ end
   Takes array, len of the fields in the struct. Works around rb_struct_define()'s use of varargs.
   Stopping at 100 because fuck.
  */
-static VALUE rb_mysql_struct_define2(const char *name, char **ary, int len) {
+static VALUE rb_mysql_struct_define2(const char *name, char **ary, my_ulonglong len) {
   VALUE st;
 
   switch (len) {
