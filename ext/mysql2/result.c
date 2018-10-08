@@ -22,7 +22,7 @@ static rb_encoding *binaryEncoding;
 
 typedef struct {
   int symbolizeKeys;
-  int as;
+  int resultAs;
   int castBool;
   int cacheRows;
   int cast;
@@ -41,7 +41,7 @@ static VALUE sym_symbolize_keys, sym_as, sym_array, sym_struct, sym_database_tim
   sym_application_timezone, sym_local, sym_utc, sym_cast_booleans,
   sym_cache_rows, sym_cast, sym_stream, sym_name;
 
-/* internal :as constants */
+/* internal resultAs constants */
 #define AS_HASH   0
 #define AS_ARRAY  1
 #define AS_STRUCT 2
@@ -58,7 +58,7 @@ static void rb_mysql_result_mark(void * wrapper) {
     rb_gc_mark(w->fields);
     rb_gc_mark(w->rows);
     rb_gc_mark(w->encoding);
-    rb_gc_mark(w->asStruct);
+    rb_gc_mark(w->rowStruct);
     rb_gc_mark(w->client);
     rb_gc_mark(w->statement);
   }
@@ -342,7 +342,7 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
     }
   }
 
-  if (args->as == AS_HASH) {
+  if (args->resultAs == AS_HASH) {
     rowVal = rb_hash_new();
   } else {
     rowVal = rb_ary_new2(wrapper->numberOfFields);
@@ -476,15 +476,15 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
       }
     }
 
-    if (args->as == AS_HASH) {
+    if (args->resultAs == AS_HASH) {
       rb_hash_aset(rowVal, field, val);
     } else {
       rb_ary_push(rowVal, val);
     }
   }
 
-  if (args->as == AS_STRUCT) {
-    if (wrapper->asStruct == Qnil) {
+  if (args->resultAs == AS_STRUCT) {
+    if (wrapper->rowStruct == Qnil) {
       char *buf[STRUCT_MAX_COLUMNS];
 
       if (wrapper->numberOfFields > STRUCT_MAX_COLUMNS)
@@ -495,10 +495,10 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
         buf[i] = StringValuePtr(field);
       }
 
-      wrapper->asStruct = rb_mysql_struct_define2(NULL, buf, wrapper->numberOfFields);
+      wrapper->rowStruct = rb_mysql_struct_define2(NULL, buf, wrapper->numberOfFields);
     }
 
-    rowVal = rb_struct_alloc(wrapper->asStruct, rowVal); 
+    rowVal = rb_struct_alloc(wrapper->rowStruct, rowVal); 
   }
 
   return rowVal;
@@ -529,9 +529,10 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
     wrapper->fields = rb_ary_new2(wrapper->numberOfFields);
   }
   
-  if (args->as == AS_HASH) {
+  if (args->resultAs == AS_HASH) {
     rowVal = rb_hash_new();
-  } else {
+  } else /* array or struct */ {
+    /* struct uses array as an intermediary */
     rowVal = rb_ary_new2(wrapper->numberOfFields);
   }
   fieldLengths = mysql_fetch_lengths(wrapper->result);
@@ -702,22 +703,29 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
           break;
         }
       }
-      if (args->as == AS_HASH) {
+      if (args->resultAs == AS_HASH) {
         rb_hash_aset(rowVal, field, val);
-      } else {
+      } else /* array or struct */ {
         rb_ary_push(rowVal, val);
       }
     } else {
-      if (args->as == AS_HASH) {
+      if (args->resultAs == AS_HASH) {
         rb_hash_aset(rowVal, field, Qnil);
-      } else {
+      } else /* array or struct */ {
         rb_ary_push(rowVal, Qnil);
       }
     }
   }
 
-  if (args->as == AS_STRUCT) {
-    if (wrapper->asStruct == Qnil) {
+  /* turn intermediate array into struct */
+  if (args->resultAs == AS_STRUCT) {
+    if (wrapper->rowStruct == Qnil) {
+
+/*
+  idea: use rb_struct_s_def(int argc, VALUE *argv, VALUE klass) to create anonymous struct,
+  the argvs must be pointers to symbols
+  it's a mistake to use args->symbolizeKeys in rb_mysql_result_fetch_field call; it should always be true
+ */
       char *buf[STRUCT_MAX_COLUMNS];
 
       if (wrapper->numberOfFields > STRUCT_MAX_COLUMNS)
@@ -728,10 +736,10 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
         buf[i] = StringValuePtr(field);
       }
 
-      wrapper->asStruct = rb_mysql_struct_define2(NULL, buf, wrapper->numberOfFields);
+      wrapper->rowStruct = rb_mysql_struct_define2(NULL, buf, wrapper->numberOfFields);
     }
 
-    rowVal = rb_struct_alloc(wrapper->asStruct, rowVal); 
+    rowVal = rb_struct_alloc(wrapper->rowStruct, rowVal); 
   }
 
   return rowVal;
@@ -859,7 +867,7 @@ static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
   result_each_args args;
   VALUE defaults, opts, block, (*fetch_row_func)(VALUE, MYSQL_FIELD *fields, const result_each_args *args);
   ID db_timezone, app_timezone, dbTz, appTz;
-  int symbolizeKeys, as, castBool, cacheRows, cast;
+  int symbolizeKeys, resultAs, castBool, cacheRows, cast;
 
   GET_RESULT(self);
 
@@ -876,15 +884,15 @@ static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
   }
 
   symbolizeKeys = RTEST(rb_hash_aref(opts, sym_symbolize_keys));
-  as            = AS_HASH;
+  resultAs      = AS_HASH;
   castBool      = RTEST(rb_hash_aref(opts, sym_cast_booleans));
   cacheRows     = RTEST(rb_hash_aref(opts, sym_cache_rows));
   cast          = RTEST(rb_hash_aref(opts, sym_cast));
 
   if (rb_hash_aref(opts, sym_as) == sym_array) {
-    as = AS_ARRAY;
+    resultAs = AS_ARRAY;
   } else if (rb_hash_aref(opts, sym_as) == sym_struct) {
-    as = AS_STRUCT;
+    resultAs = AS_STRUCT;
   }
 
   if (wrapper->is_streaming && cacheRows) {
@@ -935,7 +943,7 @@ static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
 
   // Backward compat
   args.symbolizeKeys = symbolizeKeys;
-  args.as = as;
+  args.resultAs = resultAs;
   args.castBool = castBool;
   args.cacheRows = cacheRows;
   args.cast = cast;
@@ -986,7 +994,7 @@ VALUE rb_mysql_result_to_obj(VALUE client, VALUE encoding, VALUE options, MYSQL_
   wrapper->result = r;
   wrapper->fields = Qnil;
   wrapper->rows = Qnil;
-  wrapper->asStruct = Qnil;
+  wrapper->rowStruct = Qnil;
   wrapper->encoding = encoding;
   wrapper->streamingComplete = 0;
   wrapper->client = client;
