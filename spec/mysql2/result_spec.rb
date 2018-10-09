@@ -74,10 +74,7 @@ RSpec.describe Mysql2::Result do
 
     it "should be able to return results as a struct" do
       @result.each(as: :struct) do |row|
-        # errol note: fix me
-        # expect(row).to be_an_instance_of(Struct)
-        # expect(row).to be_a_kind_of(Struct)
-        row.kind_of?(Struct).should be_true
+        expect(row).to be_kind_of(Struct)
       end
     end
 
