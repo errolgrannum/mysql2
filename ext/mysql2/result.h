@@ -11,6 +11,7 @@ typedef struct {
   VALUE client;
   VALUE encoding;
   VALUE statement;
+  VALUE asStruct;
   my_ulonglong numberOfFields;
   my_ulonglong numberOfRows;
   unsigned long lastRowProcessed;
