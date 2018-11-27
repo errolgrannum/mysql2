@@ -54,9 +54,9 @@ static rb_encoding *binaryEncoding;
 
 typedef struct {
   int symbolizeKeys;
-  int as;
+  int rowsAs;
   int castBool;
-  int castDateTime;
+  int castDateAsTime;
   int cacheRows;
   int cast;
   int streaming;
@@ -71,17 +71,13 @@ static VALUE opt_decimal_zero, opt_float_zero, opt_time_year, opt_time_month, op
 extern VALUE mMysql2, cMysql2Client, cMysql2Error;
 static ID intern_new, intern_utc, intern_local, intern_localtime, intern_local_offset, intern_civil, intern_new_offset;
 static VALUE sym_symbolize_keys, sym_as, sym_array, sym_struct, sym_database_timezone, sym_application_timezone,
-          sym_local, sym_utc, sym_cast_booleans, sym_cast_datetimes, sym_cache_rows, sym_cast, sym_stream, sym_name;
+          sym_local, sym_utc, sym_cast_booleans, sym_cast_dates_as_times, sym_cache_rows, sym_cast, sym_stream, sym_name;
 static ID intern_merge;
 
-/* internal :as constants */
+/* internal rowsAs constants */
 #define AS_HASH   0
 #define AS_ARRAY  1
 #define AS_STRUCT 2
-
-/* wrapper for intern.h:rb_struct_define() */
-#define STRUCT_MAX_COLUMNS  100
-static VALUE rb_mysql_struct_define2(const char *name, char **ary, int len);
 
 
 /* Mark any VALUEs that are only referenced in C, so the GC won't get them. */
@@ -91,7 +87,7 @@ static void rb_mysql_result_mark(void * wrapper) {
     rb_gc_mark(w->fields);
     rb_gc_mark(w->rows);
     rb_gc_mark(w->encoding);
-    rb_gc_mark(w->asStruct);
+    rb_gc_mark(w->rowStruct);
     rb_gc_mark(w->client);
     rb_gc_mark(w->statement);
   }
@@ -221,6 +217,20 @@ static VALUE rb_mysql_result_fetch_field(VALUE self, unsigned int idx, int symbo
   return rb_field;
 }
 
+static VALUE cast_row_as_struct(VALUE self, VALUE rowVal, mysql2_result_wrapper *wrapper)
+{
+  /* create struct from intermediate array */
+  if (wrapper->rowStruct == Qnil) {
+    unsigned int i;
+    VALUE *argv_fields = ALLOCA_N(VALUE, wrapper->numberOfFields);
+    for (i = 0; i < wrapper->numberOfFields; i++) {
+      argv_fields[i] = rb_mysql_result_fetch_field(self, i, 1);
+    }
+    wrapper->rowStruct = rb_funcall2(rb_cStruct, intern_new, (int) wrapper->numberOfFields, argv_fields);
+  }
+   return rb_struct_alloc(wrapper->rowStruct, rowVal);
+}
+
 #ifdef HAVE_RUBY_ENCODING_H
 static VALUE mysql2_set_field_string_encoding(VALUE val, MYSQL_FIELD field, rb_encoding *default_internal_enc, rb_encoding *conn_enc) {
   /* if binary flag is set, respect its wishes */
@@ -265,6 +275,20 @@ static unsigned int msec_char_to_uint(char *msec_char, size_t len)
     }
   }
   return (unsigned int)strtoul(msec_char, NULL, 10);
+}
+
+static VALUE new_time(unsigned int year, unsigned int month, unsigned int day, unsigned int hour, unsigned int minute, unsigned int second, unsigned long second_part, const result_each_args *args)
+{
+  VALUE val;
+   val = rb_funcall(rb_cTime, args->db_timezone, 7, UINT2NUM(year), UINT2NUM(month), UINT2NUM(day), UINT2NUM(hour), UINT2NUM(minute), UINT2NUM(second), ULONG2NUM(second_part));
+  if (!NIL_P(args->app_timezone)) {
+    if (args->app_timezone == intern_local) {
+      val = rb_funcall(val, intern_localtime, 0);
+    } else { // utc
+      val = rb_funcall(val, intern_utc, 0);
+    }
+  }
+  return val;
 }
 
 static void rb_mysql_result_alloc_result_buffers(VALUE self, MYSQL_FIELD *fields) {
@@ -390,7 +414,7 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
     }
   }
 
-  if (args->as == AS_HASH) {
+  if (args->rowsAs == AS_HASH) {
     rowVal = rb_hash_new();
   } else {
     rowVal = rb_ary_new2(wrapper->numberOfFields);
@@ -457,15 +481,8 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
         case MYSQL_TYPE_DATE:         // MYSQL_TIME
         case MYSQL_TYPE_NEWDATE:      // MYSQL_TIME
           ts = (MYSQL_TIME*)result_buffer->buffer;
-          if (args->castDateTime) {
-            val = rb_funcall(rb_cTime, args->db_timezone, 3, INT2NUM(ts->year), INT2NUM(ts->month), INT2NUM(ts->day));
-            if (!NIL_P(args->app_timezone)) {
-              if (args->app_timezone == intern_local) {
-                val = rb_funcall(val, intern_localtime, 0);
-              } else { /* utc */
-                val = rb_funcall(val, intern_utc, 0);
-              }
-            }
+          if (args->castDateAsTime) {
+            val = new_time(ts->year, ts->month, ts->day, 0, 0, 0, 0, args);
           } else {
             val = rb_funcall(cDate, intern_new, 3, INT2NUM(ts->year), INT2NUM(ts->month), INT2NUM(ts->day));
           }
@@ -502,14 +519,7 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
               }
             }
           } else {
-            val = rb_funcall(rb_cTime, args->db_timezone, 7, UINT2NUM(ts->year), UINT2NUM(ts->month), UINT2NUM(ts->day), UINT2NUM(ts->hour), UINT2NUM(ts->minute), UINT2NUM(ts->second), ULONG2NUM(ts->second_part));
-            if (!NIL_P(args->app_timezone)) {
-              if (args->app_timezone == intern_local) {
-                val = rb_funcall(val, intern_localtime, 0);
-              } else { // utc
-                val = rb_funcall(val, intern_utc, 0);
-              }
-            }
+            val = new_time(ts->year, ts->month, ts->day, ts->hour, ts->minute, ts->second, ts->second_part, args);
           }
           break;
         }
@@ -536,29 +546,15 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
       }
     }
 
-    if (args->as == AS_HASH) {
+    if (args->rowsAs == AS_HASH) {
       rb_hash_aset(rowVal, field, val);
     } else {
       rb_ary_push(rowVal, val);
     }
   }
 
-  if (args->as == AS_STRUCT) {
-    if (wrapper->asStruct == Qnil) {
-      char *buf[STRUCT_MAX_COLUMNS];
-
-      if (wrapper->numberOfFields > STRUCT_MAX_COLUMNS)
-        rb_raise(cMysql2Error, "Too many struct fields: %d", wrapper->numberOfFields);
-
-      for (i = 0; i < wrapper->numberOfFields; i++) {
-        VALUE field = rb_mysql_result_fetch_field(self, i, args->symbolizeKeys);
-        buf[i] = StringValuePtr(field);
-      }
-
-      wrapper->asStruct = rb_mysql_struct_define2(NULL, buf, wrapper->numberOfFields);
-    }
-
-    rowVal = rb_struct_alloc(wrapper->asStruct, rowVal); 
+  if (args->rowsAs == AS_STRUCT) {
+    rowVal = cast_row_as_struct(self, rowVal, wrapper);
   }
 
   return rowVal;
@@ -592,7 +588,7 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
     wrapper->numberOfFields = mysql_num_fields(wrapper->result);
     wrapper->fields = rb_ary_new2(wrapper->numberOfFields);
   }
-  if (args->as == AS_HASH) {
+  if (args->rowsAs == AS_HASH) {
     rowVal = rb_hash_new();
   } else {
     rowVal = rb_ary_new2(wrapper->numberOfFields);
@@ -717,14 +713,7 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
                 }
               } else {
                 msec = msec_char_to_uint(msec_char, sizeof(msec_char));
-                val = rb_funcall(rb_cTime, args->db_timezone, 7, UINT2NUM(year), UINT2NUM(month), UINT2NUM(day), UINT2NUM(hour), UINT2NUM(min), UINT2NUM(sec), UINT2NUM(msec));
-                if (!NIL_P(args->app_timezone)) {
-                  if (args->app_timezone == intern_local) {
-                    val = rb_funcall(val, intern_localtime, 0);
-                  } else { /* utc */
-                    val = rb_funcall(val, intern_utc, 0);
-                  }
-                }
+                val = new_time(year, month, day, hour, min, sec, msec, args);
               }
             }
           }
@@ -746,15 +735,8 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
               rb_raise(cMysql2Error, "Invalid date in field '%.*s': %s", fields[i].name_length, fields[i].name, row[i]);
               val = Qnil;
             } else {
-              if (args->castDateTime) {
-                val = rb_funcall(rb_cTime, args->db_timezone, 3, UINT2NUM(year), UINT2NUM(month), UINT2NUM(day));
-                if (!NIL_P(args->app_timezone)) {
-                  if (args->app_timezone == intern_local) {
-                    val = rb_funcall(val, intern_localtime, 0);
-                  } else { /* utc */
-                    val = rb_funcall(val, intern_utc, 0);
-                  }
-                }
+              if (args->castDateAsTime) {
+                val = new_time(year, month, day, 0, 0, 0, 0, args);
               } else {
                 val = rb_funcall(cDate, intern_new, 3, UINT2NUM(year), UINT2NUM(month), UINT2NUM(day));
               }
@@ -780,13 +762,13 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
           break;
         }
       }
-      if (args->as == AS_HASH) {
+      if (args->rowsAs == AS_HASH) {
         rb_hash_aset(rowVal, field, val);
       } else {
         rb_ary_push(rowVal, val);
       }
     } else {
-      if (args->as == AS_HASH) {
+      if (args->rowsAs == AS_HASH) {
         rb_hash_aset(rowVal, field, Qnil);
       } else {
         rb_ary_push(rowVal, Qnil);
@@ -794,22 +776,8 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
     }
   }
 
-  if (args->as == AS_STRUCT) {
-    if (wrapper->asStruct == Qnil) {
-      char *buf[STRUCT_MAX_COLUMNS];
-
-      if (wrapper->numberOfFields > STRUCT_MAX_COLUMNS)
-        rb_raise(cMysql2Error, "Too many struct fields: %d", wrapper->numberOfFields);
-
-      for (i = 0; i < wrapper->numberOfFields; i++) {
-        VALUE field = rb_mysql_result_fetch_field(self, i, args->symbolizeKeys);
-        buf[i] = StringValuePtr(field);
-      }
-
-      wrapper->asStruct = rb_mysql_struct_define2(NULL, buf, wrapper->numberOfFields);
-    }
-
-    rowVal = rb_struct_alloc(wrapper->asStruct, rowVal); 
+  if (args->rowsAs == AS_STRUCT) {
+    rowVal = cast_row_as_struct(self, rowVal, wrapper);
   }
 
   return rowVal;
@@ -824,7 +792,7 @@ static VALUE rb_mysql_result_fetch_fields(VALUE self) {
 
   defaults = rb_iv_get(self, "@query_options");
   Check_Type(defaults, T_HASH);
-  if (rb_hash_aref(defaults, sym_symbolize_keys) == Qtrue) {
+  if (rb_hash_aref(defaults, sym_symbolize_keys) == Qtrue || rb_hash_aref(defaults, sym_as) == sym_struct) {
     symbolizeKeys = 1;
   }
 
@@ -935,9 +903,9 @@ static VALUE rb_mysql_result_each_(VALUE self,
 
 static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
   result_each_args args;
-  VALUE defaults, opts, block, (*fetch_row_func)(VALUE, MYSQL_FIELD *fields, const result_each_args *args);
+  VALUE defaults, opts, as_opt, block, (*fetch_row_func)(VALUE, MYSQL_FIELD *fields, const result_each_args *args);
   ID db_timezone, app_timezone, dbTz, appTz;
-  int symbolizeKeys, as, castBool, castDateTime, cacheRows, cast;
+  int symbolizeKeys, rowsAs, castBool, castDateAsTime, cacheRows, cast;
 
   GET_RESULT(self);
 
@@ -954,16 +922,19 @@ static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
   }
 
   symbolizeKeys = RTEST(rb_hash_aref(opts, sym_symbolize_keys));
-  as            = AS_HASH;
   castBool      = RTEST(rb_hash_aref(opts, sym_cast_booleans));
-  castDateTime  = RTEST(rb_hash_aref(opts, sym_cast_datetimes));
+  castDateAsTime  = RTEST(rb_hash_aref(opts, sym_cast_dates_as_times));
   cacheRows     = RTEST(rb_hash_aref(opts, sym_cache_rows));
   cast          = RTEST(rb_hash_aref(opts, sym_cast));
 
-  if (rb_hash_aref(opts, sym_as) == sym_array) {
-    as = AS_ARRAY;
-  } else if (rb_hash_aref(opts, sym_as) == sym_struct) {
-    as = AS_STRUCT;
+  as_opt = rb_hash_aref(opts, sym_as);
+  if (as_opt == sym_array) {
+    rowsAs = AS_ARRAY;
+  } else if (as_opt == sym_struct) {
+    rowsAs = AS_STRUCT;
+    symbolizeKeys = 1;  /* force */
+  } else {
+    rowsAs = AS_HASH;
   }
 
   if (wrapper->is_streaming && cacheRows) {
@@ -1014,9 +985,9 @@ static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
 
   // Backward compat
   args.symbolizeKeys = symbolizeKeys;
-  args.as = as;
+  args.rowsAs = rowsAs;
   args.castBool = castBool;
-  args.castDateTime = castDateTime;
+  args.castDateAsTime = castDateAsTime;
   args.cacheRows = cacheRows;
   args.cast = cast;
   args.db_timezone = db_timezone;
@@ -1066,7 +1037,7 @@ VALUE rb_mysql_result_to_obj(VALUE client, VALUE encoding, VALUE options, MYSQL_
   wrapper->result = r;
   wrapper->fields = Qnil;
   wrapper->rows = Qnil;
-  wrapper->asStruct = Qnil;
+  wrapper->rowStruct = Qnil;
   wrapper->encoding = encoding;
   wrapper->streamingComplete = 0;
   wrapper->client = client;
@@ -1124,7 +1095,7 @@ void init_mysql2_result() {
   sym_local           = ID2SYM(rb_intern("local"));
   sym_utc             = ID2SYM(rb_intern("utc"));
   sym_cast_booleans   = ID2SYM(rb_intern("cast_booleans"));
-  sym_cast_datetimes  = ID2SYM(rb_intern("cast_datetimes"));
+  sym_cast_dates_as_times   = ID2SYM(rb_intern("cast_datetimes"));
   sym_database_timezone     = ID2SYM(rb_intern("database_timezone"));
   sym_application_timezone  = ID2SYM(rb_intern("application_timezone"));
   sym_cache_rows      = ID2SYM(rb_intern("cache_rows"));
@@ -1143,331 +1114,4 @@ void init_mysql2_result() {
 #ifdef HAVE_RUBY_ENCODING_H
   binaryEncoding = rb_enc_find("binary");
 #endif
-}
-
-/*
-# Ruby snippet to create the switch statement below.
-def xxx
-    return (1..STRUCT_MAX_COLUMNS).collect do |i|
-        "  case #{i}:\n    st = rb_struct_define(name, " + 
-        i.times.collect {|a| "ary[#{a}], "}.join +
-        "NULL);\n    break;\n"
-    end.join
-end
-*/
-
-/*
-  Wrapper for intern.h:rb_struct_define().
-  Takes array, len of the fields in the struct. Works around rb_struct_define()'s use of varargs.
-  Stopping at 100 because fuck.
- */
-static VALUE rb_mysql_struct_define2(const char *name, char **ary, int len) {
-  VALUE st;
-
-  switch (len) {
-  case 1:
-    st = rb_struct_define(name, ary[0], NULL);
-    break;
-  case 2:
-    st = rb_struct_define(name, ary[0], ary[1], NULL);
-    break;
-  case 3:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], NULL);
-    break;
-  case 4:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], NULL);
-    break;
-  case 5:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], NULL);
-    break;
-  case 6:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], NULL);
-    break;
-  case 7:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], NULL);
-    break;
-  case 8:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], NULL);
-    break;
-  case 9:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], NULL);
-    break;
-  case 10:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], NULL);
-    break;  
-  case 11:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], NULL);
-    break;
-  case 12:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], NULL);
-    break;
-  case 13:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], NULL);
-    break;
-  case 14:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], NULL);
-    break;
-  case 15:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], NULL);
-    break;
-  case 16:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], NULL);
-    break;
-  case 17:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], NULL);
-    break;
-  case 18:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], NULL);
-    break;
-  case 19:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], NULL);
-    break;
-  case 20:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], NULL);
-    break;
-  case 21:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], NULL);
-    break;
-  case 22:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], NULL);
-    break;
-  case 23:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], NULL);
-    break;
-  case 24:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], NULL);
-    break;
-  case 25:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], NULL);
-    break;
-  case 26:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], NULL);
-    break;
-  case 27:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], NULL);
-    break;
-  case 28:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], NULL);
-    break;
-  case 29:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], NULL);
-    break;
-  case 30:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], NULL);
-    break;
-  case 31:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], NULL);
-    break;
-  case 32:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], NULL);
-    break;
-  case 33:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], NULL);
-    break;
-  case 34:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], NULL);
-    break;
-  case 35:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], NULL);
-    break;
-  case 36:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], NULL);
-    break;
-  case 37:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], NULL);
-    break;
-  case 38:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], NULL);
-    break;
-  case 39:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], NULL);
-    break;
-  case 40:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], NULL);
-    break;
-  case 41:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], NULL);
-    break;
-  case 42:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], NULL);
-    break;
-  case 43:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], NULL);
-    break;
-  case 44:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], NULL);
-    break;
-  case 45:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], NULL);
-    break;
-  case 46:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], NULL);
-    break;
-  case 47:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], NULL);
-    break;
-  case 48:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], NULL);
-    break;
-  case 49:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], NULL);
-    break;
-  case 50:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], NULL);
-    break;
-  case 51:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], NULL);
-    break;
-  case 52:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], NULL);
-    break;
-  case 53:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], NULL);
-    break;
-  case 54:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], NULL);
-    break;
-  case 55:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], NULL);
-    break;
-  case 56:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], NULL);
-    break;
-  case 57:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], NULL);
-    break;
-  case 58:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], NULL);
-    break;
-  case 59:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], NULL);
-    break;
-  case 60:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], NULL);
-    break;
-  case 61:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], NULL);
-    break;
-  case 62:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], NULL);
-    break;
-  case 63:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], NULL);
-    break;
-  case 64:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], NULL);
-    break;
-  case 65:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], NULL);
-    break;
-  case 66:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], NULL);
-    break;
-  case 67:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], NULL);
-    break;
-  case 68:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], NULL);
-    break;
-  case 69:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], NULL);
-    break;
-  case 70:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], NULL);
-    break;
-  case 71:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], NULL);
-    break;
-  case 72:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], NULL);
-    break;
-  case 73:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], NULL);
-    break;
-  case 74:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], NULL);
-    break;
-  case 75:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], NULL);
-    break;
-  case 76:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], NULL);
-    break;
-  case 77:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], NULL);
-    break;
-  case 78:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], NULL);
-    break;
-  case 79:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], NULL);
-    break;
-  case 80:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], NULL);
-    break;
-  case 81:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], NULL);
-    break;
-  case 82:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], NULL);
-    break;
-  case 83:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], NULL);
-    break;
-  case 84:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], ary[83], NULL);
-    break;
-  case 85:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], ary[83], ary[84], NULL);
-    break;
-  case 86:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], ary[83], ary[84], ary[85], NULL);
-    break;
-  case 87:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], ary[83], ary[84], ary[85], ary[86], NULL);
-    break;
-  case 88:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], ary[83], ary[84], ary[85], ary[86], ary[87], NULL);
-    break;
-  case 89:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], ary[83], ary[84], ary[85], ary[86], ary[87], ary[88], NULL);
-    break;
-  case 90:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], ary[83], ary[84], ary[85], ary[86], ary[87], ary[88], ary[89], NULL);
-    break;
-  case 91:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], ary[83], ary[84], ary[85], ary[86], ary[87], ary[88], ary[89], ary[90], NULL);
-    break;
-  case 92:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], ary[83], ary[84], ary[85], ary[86], ary[87], ary[88], ary[89], ary[90], ary[91], NULL);
-    break;
-  case 93:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], ary[83], ary[84], ary[85], ary[86], ary[87], ary[88], ary[89], ary[90], ary[91], ary[92], NULL);
-    break;
-  case 94:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], ary[83], ary[84], ary[85], ary[86], ary[87], ary[88], ary[89], ary[90], ary[91], ary[92], ary[93], NULL);
-    break;
-  case 95:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], ary[83], ary[84], ary[85], ary[86], ary[87], ary[88], ary[89], ary[90], ary[91], ary[92], ary[93], ary[94], NULL);
-    break;
-  case 96:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], ary[83], ary[84], ary[85], ary[86], ary[87], ary[88], ary[89], ary[90], ary[91], ary[92], ary[93], ary[94], ary[95], NULL);
-    break;
-  case 97:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], ary[83], ary[84], ary[85], ary[86], ary[87], ary[88], ary[89], ary[90], ary[91], ary[92], ary[93], ary[94], ary[95], ary[96], NULL);
-    break;
-  case 98:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], ary[83], ary[84], ary[85], ary[86], ary[87], ary[88], ary[89], ary[90], ary[91], ary[92], ary[93], ary[94], ary[95], ary[96], ary[97], NULL);
-    break;
-  case 99:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], ary[83], ary[84], ary[85], ary[86], ary[87], ary[88], ary[89], ary[90], ary[91], ary[92], ary[93], ary[94], ary[95], ary[96], ary[97], ary[98], NULL);
-    break;
-  case 100:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], ary[83], ary[84], ary[85], ary[86], ary[87], ary[88], ary[89], ary[90], ary[91], ary[92], ary[93], ary[94], ary[95], ary[96], ary[97], ary[98], ary[99], NULL);
-    break;
-  default:
-    st = Qnil;
-  }
-
-  return st;
 }
